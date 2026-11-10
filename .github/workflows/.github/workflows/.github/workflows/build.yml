@@ -1,0 +1,971 @@
+name: Build WordBlocker APK
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  build-apk:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.7'
+
+      - name: Generate Android Project Files
+        run: |
+          mkdir -p app/src/main/java/com/example/wordblocker
+          mkdir -p app/src/main/res/xml
+          mkdir -p app/src/main/res/values
+
+          cat << 'EOF' > settings.gradle
+          pluginManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+          }
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+              repositories {
+                  google()
+                  mavenCentral()
+              }
+          }
+          rootProject.name = "WordBlocker"
+          include(":app")
+          EOF
+
+          cat << 'EOF' > build.gradle
+          plugins {
+              id 'com.android.application' version '8.2.2' apply false
+              id 'org.jetbrains.kotlin.android' version '1.9.22' apply false
+          }
+          EOF
+
+          cat << 'EOF' > app/build.gradle
+          plugins {
+              id 'com.android.application'
+              id 'org.jetbrains.kotlin.android'
+          }
+
+          android {
+              namespace 'com.example.wordblocker'
+              compileSdk 34
+
+              defaultConfig {
+                  applicationId "com.example.wordblocker"
+                  minSdk 24
+                  targetSdk 34
+                  versionCode 1
+                  versionName "1.0"
+              }
+
+              compileOptions {
+                  sourceCompatibility JavaVersion.VERSION_17
+                  targetCompatibility JavaVersion.VERSION_17
+              }
+              kotlinOptions {
+                  jvmTarget = '17'
+              }
+          }
+
+          dependencies {
+          }
+          EOF
+
+          cat << 'EOF' > app/src/main/res/values/strings.xml
+          <?xml version="1.0" encoding="utf-8"?>
+          <resources>
+              <string name="app_name">Word Blocker</string>
+              <string name="acc_service_description">Blocks saved forbidden words and phrases across all apps and browsers.</string>
+          </resources>
+          EOF
+
+          cat << 'EOF' > app/src/main/res/xml/accessibility_service_config.xml
+          <?xml version="1.0" encoding="utf-8"?>
+          <accessibility-service xmlns:android="http://schemas.android.com/apk/res/android"
+              android:description="@string/acc_service_description"
+              android:accessibilityEventTypes="typeViewTextChanged|typeViewTextSelectionChanged|typeWindowContentChanged|typeViewFocused"
+              android:accessibilityFeedbackType="feedbackGeneric"
+              android:accessibilityFlags="flagDefault|flagIncludeNotImportantViews|flagReportViewIds|flagRetrieveInteractiveWindows"
+              android:canRetrieveWindowContent="true"
+              android:notificationTimeout="50" />
+          EOF
+
+          cat << 'EOF' > app/src/main/AndroidManifest.xml
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
+              <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
+              <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+
+              <application
+                  android:allowBackup="true"
+                  android:icon="@android:drawable/ic_lock_idle_lock"
+                  android:label="Word Blocker"
+                  android:supportsRtl="true"
+                  android:theme="@android:style/Theme.Material.Light.NoActionBar">
+
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true"
+                      android:windowSoftInputMode="adjustResize">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+
+                  <service
+                      android:name=".WordBlockerAccessibilityService"
+                      android:exported="false"
+                      android:label="Word Blocker Protection"
+                      android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE">
+                      <intent-filter>
+                          <action android:name="android.accessibilityservice.AccessibilityService" />
+                      </intent-filter>
+                      <meta-data
+                          android:name="android.accessibilityservice"
+                          android:resource="@xml/accessibility_service_config" />
+                  </service>
+
+                  <service
+                      android:name=".KeepAliveForegroundService"
+                      android:exported="false"
+                      android:foregroundServiceType="specialUse">
+                      <property
+                          android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                          android:value="persistent_word_blocker" />
+                  </service>
+
+              </application>
+          </manifest>
+          EOF
+
+          cat << 'EOF' > app/src/main/java/com/example/wordblocker/WordBlockerApp.kt
+          package com.example.wordblocker
+
+          import android.accessibilityservice.AccessibilityService
+          import android.accessibilityservice.AccessibilityServiceInfo
+          import android.app.Activity
+          import android.app.AlertDialog
+          import android.app.Notification
+          import android.app.NotificationChannel
+          import android.app.NotificationManager
+          import android.app.PendingIntent
+          import android.app.Service
+          import android.content.ClipboardManager
+          import android.content.ClipData
+          import android.content.ComponentName
+          import android.content.Context
+          import android.content.Intent
+          import android.graphics.Color
+          import android.graphics.PixelFormat
+          import android.graphics.Typeface
+          import android.graphics.drawable.GradientDrawable
+          import android.net.Uri
+          import android.os.Build
+          import android.os.Bundle
+          import android.os.CountDownTimer
+          import android.os.Handler
+          import android.os.IBinder
+          import android.os.Looper
+          import android.provider.Settings
+          import android.text.TextUtils
+          import android.util.TypedValue
+          import android.view.Gravity
+          import android.view.View
+          import android.view.ViewGroup
+          import android.view.WindowManager
+          import android.view.accessibility.AccessibilityEvent
+          import android.view.accessibility.AccessibilityNodeInfo
+          import android.widget.ArrayAdapter
+          import android.widget.Button
+          import android.widget.EditText
+          import android.widget.LinearLayout
+          import android.widget.ListView
+          import android.widget.Switch
+          import android.widget.TextView
+          import android.widget.Toast
+          import java.util.Locale
+
+          object BlockerRepository {
+              private const val PREFS_NAME = "word_blocker_prefs"
+              private const val KEY_WORDS = "blocked_words_set"
+              private const val KEY_ACTIVE = "blocker_is_active"
+
+              const val WARNING_MESSAGE_BN = "唳嗋Σ唰嵿Σ唳距唳曕 唳Ο唳� 唳曕Π唰嬥イ 唳嗋Σ唰嵿Σ唳距 唳唳ㄠ 唳灌唳班唳� 唳曕Π唰囙唰囙Θ啷�"
+              const val DELETE_COUNTDOWN_MS = 10 * 60 * 1000L
+
+              fun isBlockerActive(context: Context): Boolean {
+                  val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+                  return prefs.getBoolean(KEY_ACTIVE, true)
+              }
+
+              fun setBlockerActive(context: Context, active: Boolean) {
+                  val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+                  prefs.edit().putBoolean(KEY_ACTIVE, active).apply()
+              }
+
+              fun getBlockedWords(context: Context): Set<String> {
+                  val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+                  return prefs.getStringSet(KEY_WORDS, emptySet())?.toSet() ?: emptySet()
+              }
+
+              fun addBlockedWord(context: Context, rawWord: String): Boolean {
+                  val normalized = rawWord.trim()
+                  if (normalized.isEmpty()) return false
+                  val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+                  val updated = getBlockedWords(context).toMutableSet()
+                  val added = updated.add(normalized)
+                  if (added) {
+                      prefs.edit().putStringSet(KEY_WORDS, updated).apply()
+                  }
+                  return added
+              }
+
+              fun removeBlockedWord(context: Context, wordToRemove: String) {
+                  val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+                  val updated = getBlockedWords(context).toMutableSet()
+                  if (updated.remove(wordToRemove)) {
+                      prefs.edit().putStringSet(KEY_WORDS, updated).apply()
+                  }
+              }
+          }
+
+          class KeepAliveForegroundService : Service() {
+
+              companion object {
+                  private const val CHANNEL_ID = "word_blocker_keep_alive_channel"
+                  private const val NOTIFICATION_ID = 1001
+              }
+
+              override fun onCreate() {
+                  super.onCreate()
+                  createNotificationChannel()
+              }
+
+              override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+                  if (!BlockerRepository.isBlockerActive(this)) {
+                      stopSelf()
+                      return START_NOT_STICKY
+                  }
+
+                  val launchIntent = Intent(this, MainActivity::class.java)
+                  val pendingIntent = PendingIntent.getActivity(
+                      this,
+                      0,
+                      launchIntent,
+                      PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+                  )
+
+                  val builder = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                      Notification.Builder(this, CHANNEL_ID)
+                  } else {
+                      @Suppress("DEPRECATION")
+                      Notification.Builder(this)
+                  }
+
+                  val notification = builder
+                      .setContentTitle("Word Blocker Active")
+                      .setContentText("System-wide text protection is running.")
+                      .setSmallIcon(android.R.drawable.ic_lock_idle_lock)
+                      .setContentIntent(pendingIntent)
+                      .setOngoing(true)
+                      .build()
+
+                  startForeground(NOTIFICATION_ID, notification)
+                  return START_STICKY
+              }
+
+              override fun onBind(intent: Intent?): IBinder? = null
+
+              private fun createNotificationChannel() {
+                  if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                      val channel = NotificationChannel(
+                          CHANNEL_ID,
+                          "Word Blocker Protection Service",
+                          NotificationManager.IMPORTANCE_LOW
+                      ).apply {
+                          description = "Keeps the system-wide word blocker active in the background."
+                          setShowBadge(false)
+                      }
+                      val manager = getSystemService(NotificationManager::class.java)
+                      manager?.createNotificationChannel(channel)
+                  }
+              }
+          }
+
+          class WordBlockerAccessibilityService : AccessibilityService() {
+
+              private val mainHandler = Handler(Looper.getMainLooper())
+              private var activeOverlayView: View? = null
+              private var lastPopupTimestamp = 0L
+
+              private val clipboardListener = ClipboardManager.OnPrimaryClipChangedListener {
+                  if (BlockerRepository.isBlockerActive(this)) {
+                      sanitizeClipboardIfNeeded()
+                  }
+              }
+
+              override fun onServiceConnected() {
+                  super.onServiceConnected()
+                  val info = AccessibilityServiceInfo().apply {
+                      eventTypes = AccessibilityEvent.TYPE_VIEW_TEXT_CHANGED or
+                              AccessibilityEvent.TYPE_VIEW_TEXT_SELECTION_CHANGED or
+                              AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED or
+                              AccessibilityEvent.TYPE_VIEW_FOCUSED
+                      feedbackType = AccessibilityServiceInfo.FEEDBACK_GENERIC
+                      flags = AccessibilityServiceInfo.FLAG_DEFAULT or
+                              AccessibilityServiceInfo.FLAG_INCLUDE_NOT_IMPORTANT_VIEWS or
+                              AccessibilityServiceInfo.FLAG_REPORT_VIEW_IDS or
+                              AccessibilityServiceInfo.FLAG_RETRIEVE_INTERACTIVE_WINDOWS
+                      notificationTimeout = 50L
+                  }
+                  serviceInfo = info
+
+                  val clipboard = getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager
+                  clipboard?.addPrimaryClipChangedListener(clipboardListener)
+              }
+
+              override fun onAccessibilityEvent(event: AccessibilityEvent?) {
+                  if (event == null) return
+                  if (!BlockerRepository.isBlockerActive(this)) return
+
+                  val packageName = event.packageName?.toString() ?: ""
+                  if (packageName == this.packageName) return
+
+                  val blockedWords = BlockerRepository.getBlockedWords(this)
+                  if (blockedWords.isEmpty()) return
+
+                  val sourceNode = event.source
+                  if (sourceNode != null) {
+                      inspectAndSanitizeNode(sourceNode, blockedWords)
+                  }
+
+                  val rootNode = rootInActiveWindow
+                  if (rootNode != null) {
+                      scanWindowTreeForEditableNodes(rootNode, blockedWords, depth = 0)
+                  }
+              }
+
+              private fun scanWindowTreeForEditableNodes(
+                  node: AccessibilityNodeInfo?,
+                  blockedWords: Set<String>,
+                  depth: Int
+              ) {
+                  if (node == null || depth > 25) return
+
+                  if (node.isEditable || node.className?.contains("EditText", ignoreCase = true) == true) {
+                      inspectAndSanitizeNode(node, blockedWords)
+                  }
+
+                  val childCount = node.childCount
+                  for (i in 0 until childCount) {
+                      val child = node.getChild(i) ?: continue
+                      scanWindowTreeForEditableNodes(child, blockedWords, depth + 1)
+                  }
+              }
+
+              private fun inspectAndSanitizeNode(node: AccessibilityNodeInfo, blockedWords: Set<String>) {
+                  val currentText = node.text?.toString() ?: return
+                  if (currentText.isEmpty()) return
+
+                  if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O && node.isShowingHintText) {
+                      return
+                  }
+
+                  var sanitizedText = currentText
+                  var violationDetected = false
+
+                  for (forbidden in blockedWords) {
+                      if (forbidden.isBlank()) continue
+                      if (sanitizedText.contains(forbidden, ignoreCase = true)) {
+                          violationDetected = true
+                          sanitizedText = sanitizedText.replace(Regex(Regex.escape(forbidden), RegexOption.IGNORE_CASE), "")
+                      }
+                  }
+
+                  if (violationDetected) {
+                      val arguments = Bundle().apply {
+                          putCharSequence(
+                              AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE,
+                              sanitizedText
+                          )
+                      }
+                      val replaced = node.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, arguments)
+
+                      if (!replaced) {
+                          val clearArgs = Bundle().apply {
+                              putCharSequence(AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE, "")
+                          }
+                          node.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, clearArgs)
+                      }
+
+                      performGlobalAction(GLOBAL_ACTION_BACK)
+                      sanitizeClipboardIfNeeded()
+                      triggerWarningPopup()
+                  }
+              }
+
+              private fun sanitizeClipboardIfNeeded() {
+                  val clipboard = getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager ?: return
+                  val clip = clipboard.primaryClip ?: return
+                  if (clip.itemCount == 0) return
+
+                  val pastedText = clip.getItemAt(0).coerceToText(this)?.toString() ?: return
+                  val blockedWords = BlockerRepository.getBlockedWords(this)
+
+                  for (forbidden in blockedWords) {
+                      if (forbidden.isNotBlank() && pastedText.contains(forbidden, ignoreCase = true)) {
+                          if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+                              clipboard.clearPrimaryClip()
+                          } else {
+                              clipboard.setPrimaryClip(ClipData.newPlainText("", ""))
+                          }
+                          triggerWarningPopup()
+                          break
+                      }
+                  }
+              }
+
+              private fun triggerWarningPopup() {
+                  val now = System.currentTimeMillis()
+                  if (now - lastPopupTimestamp < 1200L) return
+                  lastPopupTimestamp = now
+
+                  mainHandler.post {
+                      showSystemOverlayOrToast()
+                  }
+              }
+
+              private fun showSystemOverlayOrToast() {
+                  Toast.makeText(applicationContext, BlockerRepository.WARNING_MESSAGE_BN, Toast.LENGTH_LONG).show()
+
+                  if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M && !Settings.canDrawOverlays(this)) {
+                      return
+                  }
+
+                  val windowManager = getSystemService(Context.WINDOW_SERVICE) as? WindowManager ?: return
+
+                  activeOverlayView?.let {
+                      try {
+                          windowManager.removeView(it)
+                      } catch (_: Exception) {
+                      }
+                      activeOverlayView = null
+                  }
+
+                  val cardBackground = GradientDrawable().apply {
+                      setColor(Color.parseColor("#B71C1C"))
+                      cornerRadius = dpToPx(16f).toFloat()
+                      setStroke(dpToPx(2f), Color.WHITE)
+                  }
+
+                  val popupLayout = LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL
+                      background = cardBackground
+                      gravity = Gravity.CENTER
+                      val padH = dpToPx(24f)
+                      val padV = dpToPx(20f)
+                      setPadding(padH, padV, padH, padV)
+                  }
+
+                  val messageView = TextView(this).apply {
+                      text = BlockerRepository.WARNING_MESSAGE_BN
+                      setTextColor(Color.WHITE)
+                      setTextSize(TypedValue.COMPLEX_UNIT_SP, 20f)
+                      setTypeface(typeface, Typeface.BOLD)
+                      gravity = Gravity.CENTER
+                  }
+
+                  val dismissBtn = Button(this).apply {
+                      text = "唳犩唳� 唳嗋唰� (OK)"
+                      setTextColor(Color.parseColor("#B71C1C"))
+                      setBackgroundColor(Color.WHITE)
+                      val params = LinearLayout.LayoutParams(
+                          LinearLayout.LayoutParams.WRAP_CONTENT,
+                          LinearLayout.LayoutParams.WRAP_CONTENT
+                      ).apply {
+                          topMargin = dpToPx(16f)
+                      }
+                      layoutParams = params
+                      setOnClickListener {
+                          try {
+                              windowManager.removeView(popupLayout)
+                          } catch (_: Exception) {
+                          }
+                          activeOverlayView = null
+                      }
+                  }
+
+                  popupLayout.addView(messageView)
+                  popupLayout.addView(dismissBtn)
+
+                  val overlayType = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                      WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
+                  } else {
+                      @Suppress("DEPRECATION")
+                      WindowManager.LayoutParams.TYPE_PHONE
+                  }
+
+                  val params = WindowManager.LayoutParams(
+                      WindowManager.LayoutParams.WRAP_CONTENT,
+                      WindowManager.LayoutParams.WRAP_CONTENT,
+                      overlayType,
+                      WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON or
+                              WindowManager.LayoutParams.FLAG_SHOW_WHEN_LOCKED,
+                      PixelFormat.TRANSLUCENT
+                  ).apply {
+                      gravity = Gravity.CENTER
+                  }
+
+                  try {
+                      windowManager.addView(popupLayout, params)
+                      activeOverlayView = popupLayout
+
+                      mainHandler.postDelayed({
+                          if (activeOverlayView === popupLayout) {
+                              try {
+                                  windowManager.removeView(popupLayout)
+                              } catch (_: Exception) {
+                              }
+                              activeOverlayView = null
+                          }
+                      }, 5000L)
+                  } catch (_: Exception) {
+                  }
+              }
+
+              private fun dpToPx(dp: Float): Int {
+                  return TypedValue.applyDimension(
+                      TypedValue.COMPLEX_UNIT_DIP,
+                      dp,
+                      resources.displayMetrics
+                  ).toInt()
+              }
+
+              override fun onInterrupt() {}
+
+              override fun onDestroy() {
+                  super.onDestroy()
+                  val clipboard = getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager
+                  clipboard?.removePrimaryClipChangedListener(clipboardListener)
+              }
+          }
+
+          class MainActivity : Activity() {
+
+              private lateinit var statusBanner: TextView
+              private lateinit var activeSwitch: Switch
+              private lateinit var wordInput: EditText
+              private lateinit var wordListAdapter: BlockedWordAdapter
+              private val wordList = mutableListOf<String>()
+              private var activeDeleteTimer: CountDownTimer? = null
+
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  setupUserInterface()
+                  ensureForegroundServiceState()
+              }
+
+              override fun onResume() {
+                  super.onResume()
+                  refreshPermissionStatusBanner()
+                  refreshWordList()
+              }
+
+              override fun onDestroy() {
+                  super.onDestroy()
+                  activeDeleteTimer?.cancel()
+              }
+
+              private fun setupUserInterface() {
+                  val root = LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL
+                      setBackgroundColor(Color.parseColor("#F8FAFC"))
+                      val pad = dpToPx(20f)
+                      setPadding(pad, pad, pad, pad)
+                  }
+
+                  val titleView = TextView(this).apply {
+                      text = "System-Wide Word Blocker"
+                      setTextSize(TypedValue.COMPLEX_UNIT_SP, 22f)
+                      setTypeface(typeface, Typeface.BOLD)
+                      setTextColor(Color.parseColor("#0F172A"))
+                  }
+                  root.addView(titleView)
+
+                  val toggleRow = LinearLayout(this).apply {
+                      orientation = LinearLayout.HORIZONTAL
+                      gravity = Gravity.CENTER_VERTICAL
+                      val params = LinearLayout.LayoutParams(
+                          LinearLayout.LayoutParams.MATCH_PARENT,
+                          LinearLayout.LayoutParams.WRAP_CONTENT
+                      ).apply {
+                          topMargin = dpToPx(12f)
+                      }
+                      layoutParams = params
+                  }
+
+                  val toggleLabel = TextView(this).apply {
+                      text = "Keep Blocker Active across Device"
+                      setTextSize(TypedValue.COMPLEX_UNIT_SP, 16f)
+                      setTextColor(Color.parseColor("#1E293B"))
+                      layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
+                  }
+
+                  activeSwitch = Switch(this).apply {
+                      isChecked = BlockerRepository.isBlockerActive(this@MainActivity)
+                      setOnCheckedChangeListener { _, isChecked ->
+                          BlockerRepository.setBlockerActive(this@MainActivity, isChecked)
+                          ensureForegroundServiceState()
+                          refreshPermissionStatusBanner()
+                      }
+                  }
+
+                  toggleRow.addView(toggleLabel)
+                  toggleRow.addView(activeSwitch)
+                  root.addView(toggleRow)
+
+                  statusBanner = TextView(this).apply {
+                      setTextSize(TypedValue.COMPLEX_UNIT_SP, 14f)
+                      val pad = dpToPx(12f)
+                      setPadding(pad, pad, pad, pad)
+                      val params = LinearLayout.LayoutParams(
+                          LinearLayout.LayoutParams.MATCH_PARENT,
+                          LinearLayout.LayoutParams.WRAP_CONTENT
+                      ).apply {
+                          topMargin = dpToPx(12f)
+                      }
+                      layoutParams = params
+                  }
+                  root.addView(statusBanner)
+
+                  val permBtnRow = LinearLayout(this).apply {
+                      orientation = LinearLayout.HORIZONTAL
+                      val params = LinearLayout.LayoutParams(
+                          LinearLayout.LayoutParams.MATCH_PARENT,
+                          LinearLayout.LayoutParams.WRAP_CONTENT
+                      ).apply {
+                          topMargin = dpToPx(8f)
+                      }
+                      layoutParams = params
+                  }
+
+                  val accBtn = Button(this).apply {
+                      text = "1. Grant Accessibility"
+                      layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
+                      setOnClickListener {
+                          startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))
+                      }
+                  }
+
+                  val overlayBtn = Button(this).apply {
+                      text = "2. Grant Popup Overlay"
+                      layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
+                      setOnClickListener {
+                          if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                              val intent = Intent(
+                                  Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
+                                  Uri.parse("package:$packageName")
+                              )
+                              startActivity(intent)
+                          }
+                      }
+                  }
+
+                  permBtnRow.addView(accBtn)
+                  permBtnRow.addView(overlayBtn)
+                  root.addView(permBtnRow)
+
+                  val inputRow = LinearLayout(this).apply {
+                      orientation = LinearLayout.HORIZONTAL
+                      gravity = Gravity.CENTER_VERTICAL
+                      val params = LinearLayout.LayoutParams(
+                          LinearLayout.LayoutParams.MATCH_PARENT,
+                          LinearLayout.LayoutParams.WRAP_CONTENT
+                      ).apply {
+                          topMargin = dpToPx(16f)
+                      }
+                      layoutParams = params
+                  }
+
+                  wordInput = EditText(this).apply {
+                      hint = "Enter word or phrase to block..."
+                      setSingleLine(true)
+                      layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
+                  }
+
+                  val addBtn = Button(this).apply {
+                      text = "Save"
+                      setOnClickListener {
+                          val candidate = wordInput.text.toString().trim()
+                          if (candidate.isEmpty()) {
+                              Toast.makeText(this@MainActivity, "Please enter a word or phrase.", Toast.LENGTH_SHORT).show()
+                              return@setOnClickListener
+                          }
+                          if (BlockerRepository.addBlockedWord(this@MainActivity, candidate)) {
+                              wordInput.setText("")
+                              refreshWordList()
+                              Toast.makeText(this@MainActivity, "Saved to permanent block list.", Toast.LENGTH_SHORT).show()
+                          } else {
+                              Toast.makeText(this@MainActivity, "Already in block list.", Toast.LENGTH_SHORT).show()
+                          }
+                      }
+                  }
+
+                  inputRow.addView(wordInput)
+                  inputRow.addView(addBtn)
+                  root.addView(inputRow)
+
+                  val listHeader = TextView(this).apply {
+                      text = "Saved Forbidden Words & Phrases (10-min timer required to delete):"
+                      setTextSize(TypedValue.COMPLEX_UNIT_SP, 14f)
+                      setTypeface(typeface, Typeface.BOLD)
+                      setTextColor(Color.parseColor("#475569"))
+                      val params = LinearLayout.LayoutParams(
+                          LinearLayout.LayoutParams.MATCH_PARENT,
+                          LinearLayout.LayoutParams.WRAP_CONTENT
+                      ).apply {
+                          topMargin = dpToPx(16f)
+                          bottomMargin = dpToPx(8f)
+                      }
+                      layoutParams = params
+                  }
+                  root.addView(listHeader)
+
+                  val listView = ListView(this).apply {
+                      layoutParams = LinearLayout.LayoutParams(
+                          LinearLayout.LayoutParams.MATCH_PARENT,
+                          0,
+                          1f
+                      )
+                  }
+                  wordListAdapter = BlockedWordAdapter(this, wordList) { wordToDelete ->
+                      showMandatoryTenMinuteDeleteDialog(wordToDelete)
+                  }
+                  listView.adapter = wordListAdapter
+                  root.addView(listView)
+
+                  setContentView(root)
+              }
+
+              private fun showMandatoryTenMinuteDeleteDialog(wordToDelete: String) {
+                  activeDeleteTimer?.cancel()
+
+                  val dialogLayout = LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL
+                      gravity = Gravity.CENTER_HORIZONTAL
+                      val pad = dpToPx(24f)
+                      setPadding(pad, pad, pad, pad)
+                  }
+
+                  val reminderText = TextView(this).apply {
+                      text = BlockerRepository.WARNING_MESSAGE_BN
+                      setTextSize(TypedValue.COMPLEX_UNIT_SP, 18f)
+                      setTypeface(typeface, Typeface.BOLD)
+                      setTextColor(Color.parseColor("#B71C1C"))
+                      gravity = Gravity.CENTER
+                  }
+
+                  val explanationText = TextView(this).apply {
+                      text = "\nTo delete \"$wordToDelete\", you must wait for the 10-minute countdown to finish."
+                      setTextSize(TypedValue.COMPLEX_UNIT_SP, 15f)
+                      setTextColor(Color.parseColor("#1E293B"))
+                      gravity = Gravity.CENTER
+                  }
+
+                  val timerText = TextView(this).apply {
+                      text = "10:00"
+                      setTextSize(TypedValue.COMPLEX_UNIT_SP, 36f)
+                      setTypeface(Typeface.MONOSPACE, Typeface.BOLD)
+                      setTextColor(Color.parseColor("#0F172A"))
+                      gravity = Gravity.CENTER
+                      val params = LinearLayout.LayoutParams(
+                          LinearLayout.LayoutParams.WRAP_CONTENT,
+                          LinearLayout.LayoutParams.WRAP_CONTENT
+                      ).apply {
+                          topMargin = dpToPx(16f)
+                          bottomMargin = dpToPx(8f)
+                      }
+                      layoutParams = params
+                  }
+
+                  dialogLayout.addView(reminderText)
+                  dialogLayout.addView(explanationText)
+                  dialogLayout.addView(timerText)
+
+                  val dialog = AlertDialog.Builder(this)
+                      .setTitle("Mandatory 10-Minute Cooldown")
+                      .setView(dialogLayout)
+                      .setCancelable(false)
+                      .setPositiveButton("Delete Now (Locked)", null)
+                      .setNegativeButton("Cancel") { d, _ ->
+                          activeDeleteTimer?.cancel()
+                          d.dismiss()
+                      }
+                      .create()
+
+                  dialog.show()
+
+                  val confirmDeleteButton = dialog.getButton(AlertDialog.BUTTON_POSITIVE)
+                  confirmDeleteButton.isEnabled = false
+                  confirmDeleteButton.setTextColor(Color.GRAY)
+
+                  confirmDeleteButton.setOnClickListener {
+                      BlockerRepository.removeBlockedWord(this, wordToDelete)
+                      refreshWordList()
+                      Toast.makeText(this, "Deleted \"$wordToDelete\".", Toast.LENGTH_SHORT).show()
+                      dialog.dismiss()
+                  }
+
+                  activeDeleteTimer = object : CountDownTimer(BlockerRepository.DELETE_COUNTDOWN_MS, 1000L) {
+                      override fun onTick(millisUntilFinished: Long) {
+                          val totalSecondsRemaining = (millisUntilFinished + 999L) / 1000L
+                          val minutes = totalSecondsRemaining / 60L
+                          val seconds = totalSecondsRemaining % 60L
+                          timerText.text = String.format(Locale.US, "%02d:%02d", minutes, seconds)
+                      }
+
+                      override fun onFinish() {
+                          timerText.text = "00:00"
+                          timerText.setTextColor(Color.parseColor("#15803D"))
+                          confirmDeleteButton.isEnabled = true
+                          confirmDeleteButton.text = "Confirm Delete"
+                          confirmDeleteButton.setTextColor(Color.parseColor("#B71C1C"))
+                      }
+                  }.start()
+              }
+
+              private fun ensureForegroundServiceState() {
+                  val serviceIntent = Intent(this, KeepAliveForegroundService::class.java)
+                  if (BlockerRepository.isBlockerActive(this)) {
+                      if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                          startForegroundService(serviceIntent)
+                      } else {
+                          startService(serviceIntent)
+                      }
+                  } else {
+                      stopService(serviceIntent)
+                  }
+              }
+
+              private fun refreshPermissionStatusBanner() {
+                  val accEnabled = isAccessibilityServiceEnabled()
+                  val overlayEnabled = Build.VERSION.SDK_INT < Build.VERSION_CODES.M || Settings.canDrawOverlays(this)
+                  val switchActive = BlockerRepository.isBlockerActive(this)
+
+                  when {
+                      !switchActive -> {
+                          statusBanner.text = "Status: Paused manually by user."
+                          statusBanner.setBackgroundColor(Color.parseColor("#FEF3C7"))
+                          statusBanner.setTextColor(Color.parseColor("#92400E"))
+                      }
+                      accEnabled && overlayEnabled -> {
+                          statusBanner.text = "Status: ACTIVE across all apps, incognito browsers, voice input & clipboard."
+                          statusBanner.setBackgroundColor(Color.parseColor("#DCFCE7"))
+                          statusBanner.setTextColor(Color.parseColor("#166534"))
+                      }
+                      else -> {
+                          val missing = mutableListOf<String>()
+                          if (!accEnabled) missing.add("Accessibility Service")
+                          if (!overlayEnabled) missing.add("Draw Over Other Apps")
+                          statusBanner.text = "Action Needed: Please grant ${missing.joinToString(" & ")} below."
+                          statusBanner.setBackgroundColor(Color.parseColor("#FEE2E2"))
+                          statusBanner.setTextColor(Color.parseColor("#991B1B"))
+                      }
+                  }
+              }
+
+              private fun refreshWordList() {
+                  wordList.clear()
+                  wordList.addAll(BlockerRepository.getBlockedWords(this).sorted())
+                  wordListAdapter.notifyDataSetChanged()
+              }
+
+              private fun isAccessibilityServiceEnabled(): Boolean {
+                  val expectedComponent = ComponentName(this, WordBlockerAccessibilityService::class.java)
+                  val enabledServices = Settings.Secure.getString(
+                      contentResolver,
+                      Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES
+                  ) ?: return false
+
+                  val splitter = TextUtils.SimpleStringSplitter(':')
+                  splitter.setString(enabledServices)
+                  while (splitter.hasNext()) {
+                      val componentString = splitter.next()
+                      val enabledComponent = ComponentName.unflattenFromString(componentString)
+                      if (enabledComponent != null && enabledComponent == expectedComponent) {
+                          return true
+                      }
+                  }
+                  return false
+              }
+
+              private fun dpToPx(dp: Float): Int {
+                  return TypedValue.applyDimension(
+                      TypedValue.COMPLEX_UNIT_DIP,
+                      dp,
+                      resources.displayMetrics
+                  ).toInt()
+              }
+
+              private class BlockedWordAdapter(
+                  context: Context,
+                  private val items: List<String>,
+                  private val onDeleteClicked: (String) -> Unit
+              ) : ArrayAdapter<String>(context, 0, items) {
+
+                  override fun getView(position: Int, convertView: View?, parent: ViewGroup): View {
+                      val word = items[position]
+                      val row = LinearLayout(context).apply {
+                          orientation = LinearLayout.HORIZONTAL
+                          gravity = Gravity.CENTER_VERTICAL
+                          val pad = TypedValue.applyDimension(
+                              TypedValue.COMPLEX_UNIT_DIP, 12f, context.resources.displayMetrics
+                          ).toInt()
+                          setPadding(pad, pad, pad, pad)
+                      }
+
+                      val wordText = TextView(context).apply {
+                          text = word
+                          setTextSize(TypedValue.COMPLEX_UNIT_SP, 16f)
+                          setTextColor(Color.parseColor("#0F172A"))
+                          layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
+                      }
+
+                      val deleteBtn = Button(context).apply {
+                          text = "Delete (10m Timer)"
+                          setTextColor(Color.parseColor("#B71C1C"))
+                          setOnClickListener { onDeleteClicked(word) }
+                      }
+
+                      row.addView(wordText)
+                      row.addView(deleteBtn)
+                      return row
+                  }
+              }
+          }
+          EOF
+
+      - name: Build Debug APK
+        run: gradle assembleDebug
+
+      - name: Upload Compiled APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: WordBlocker-APK
+          path: app/build/outputs/apk/debug/app-debug.apk
